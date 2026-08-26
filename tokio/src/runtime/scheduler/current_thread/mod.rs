@@ -580,37 +580,45 @@ impl Handle {
     ))]
     pub(crate) fn dump(&self) -> crate::runtime::Dump {
         use crate::runtime::dump;
-        use task::trace::trace_current_thread;
+        use task::trace::{drain_current_thread, trace_owned};
 
         let mut traces = vec![];
 
         // todo: how to make this work outside of a runtime context?
         context::with_scheduler(|maybe_context| {
-            // drain the local queue
             let context = if let Some(context) = maybe_context {
                 context.expect_current_thread()
             } else {
                 return;
             };
-            let mut maybe_core = context.core.borrow_mut();
-            let core = if let Some(core) = maybe_core.as_mut() {
-                core
-            } else {
-                return;
-            };
-            let local = &mut core.tasks;
 
             if self.shared.inject.is_closed() {
                 return;
             }
 
-            traces = trace_current_thread(&self.shared.owned, local, &self.shared.inject)
+            // Drain the local and injection queues, then release the borrow of
+            // the core *before* tracing polls any task.
+            //
+            // Tracing re-polls every live task, and a task may legitimately
+            // wake itself or another task while being polled. Such a wake
+            // reaches `<Arc<Handle> as Schedule>::schedule`, which borrows the
+            // core again. Holding the borrow across tracing would turn that
+            // into a `RefCell already borrowed` panic.
+            let dequeued = {
+                let mut maybe_core = context.core.borrow_mut();
+                let core = if let Some(core) = maybe_core.as_mut() {
+                    core
+                } else {
+                    return;
+                };
+
+                drain_current_thread(&mut core.tasks, &self.shared.inject)
+            };
+
+            traces = trace_owned(&self.shared.owned, dequeued)
                 .into_iter()
                 .map(|(id, trace)| dump::Task::new(id, trace))
                 .collect();
-
-            // Avoid double borrow panic
-            drop(maybe_core);
 
             // Taking a taskdump could wakes every task, but we probably don't want
             // the `yield_now` vector to be that large under normal circumstances.

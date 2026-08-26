@@ -363,14 +363,19 @@ impl<T: Future> Future for Root<T> {
     }
 }
 
-/// Trace and poll all tasks of the `current_thread` runtime.
-pub(in crate::runtime) fn trace_current_thread(
-    owned: &OwnedTasks<Arc<current_thread::Handle>>,
+/// Drain the local and injection queues of the `current_thread` runtime.
+///
+/// This establishes the precondition of [`trace_owned`]: the returned tasks are
+/// exclusively owned by the caller and no longer live in any queue.
+///
+/// Draining is separate from tracing so that the caller can release its borrow
+/// of the scheduler core before any task is polled. Polling a task may
+/// legitimately schedule work onto this same scheduler, which needs to borrow
+/// the core again.
+pub(in crate::runtime) fn drain_current_thread(
     local: &mut VecDeque<Notified<Arc<current_thread::Handle>>>,
     injection: &Inject<Arc<current_thread::Handle>>,
-) -> Vec<(Id, Trace)> {
-    // clear the local and injection queues
-
+) -> Vec<Notified<Arc<current_thread::Handle>>> {
     let mut dequeued = Vec::new();
 
     while let Some(task) = local.pop_back() {
@@ -381,8 +386,7 @@ pub(in crate::runtime) fn trace_current_thread(
         dequeued.push(task);
     }
 
-    // precondition: We have drained the tasks from the injection queue.
-    trace_owned(owned, dequeued)
+    dequeued
 }
 
 cfg_rt_multi_thread! {
@@ -430,7 +434,10 @@ cfg_rt_multi_thread! {
 ///
 /// This helper presumes exclusive access to each task. The tasks must not exist
 /// in any other queue.
-fn trace_owned<S: Schedule>(owned: &OwnedTasks<S>, dequeued: Vec<Notified<S>>) -> Vec<(Id, Trace)> {
+pub(in crate::runtime) fn trace_owned<S: Schedule>(
+    owned: &OwnedTasks<S>,
+    dequeued: Vec<Notified<S>>,
+) -> Vec<(Id, Trace)> {
     let mut tasks = dequeued;
     // Notify and trace all un-notified tasks. The dequeued tasks are already
     // notified and so do not need to be re-notified.
@@ -455,7 +462,7 @@ fn trace_owned<S: Schedule>(owned: &OwnedTasks<S>, dequeued: Vec<Notified<S>>) -
             // Re-enqueue the task's waker on the scheduler's defer queue so
             // the task is polled again after the dump completes. This is the
             // same mechanism `yield_now` uses; the defer queue is drained
-            // after `trace_current_thread` / `trace_multi_thread` returns.
+            // after the dump completes.
             //
             // We do this before polling so the borrow of the task ends before
             // the `LocalNotified` is consumed in `run()`. `defer` clones the

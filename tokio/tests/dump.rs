@@ -67,6 +67,98 @@ fn current_thread() {
     });
 }
 
+/// Regression tests for a `RefCell already borrowed` panic in the
+/// `current_thread` scheduler.
+///
+/// `Handle::dump` used to hold a mutable borrow of the scheduler core while
+/// tracing re-polled the live tasks. A task that woke itself or another task
+/// while being polled then re-entered `Schedule::schedule`, which borrows the
+/// core again, and panicked.
+mod wake_during_trace {
+    use super::*;
+
+    use std::future::Future;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Poll, Waker};
+
+    /// A task that wakes *itself* while being traced.
+    ///
+    /// The wake is deferred to the end of the poll, so the panic used to be
+    /// raised outside the task's panic guard and escape through `Handle::dump`
+    /// into whoever asked for the dump. The panic is the failure signal here;
+    /// there is nothing left to assert afterwards.
+    #[test]
+    fn self_wake() {
+        let rt = runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let task = tokio::spawn(std::future::poll_fn(|cx| {
+                if Handle::is_tracing() {
+                    cx.waker().wake_by_ref();
+                }
+                Poll::<()>::Pending
+            }));
+
+            tokio::task::yield_now().await;
+            let _dump = Handle::current().dump().await;
+
+            task.abort();
+        });
+    }
+
+    /// Two tasks that wake *each other* while being traced.
+    ///
+    /// Here the wake happens inside the traced task's own `poll`, so the panic
+    /// used to be caught by the task's panic guard: the dump appeared to
+    /// succeed while silently killing the task. The assertion below is the only
+    /// symptom, which is why this case needs one.
+    #[test]
+    fn cross_wake() {
+        let rt = runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            fn task(
+                me: Arc<Mutex<Option<Waker>>>,
+                other: Arc<Mutex<Option<Waker>>>,
+            ) -> impl Future<Output = ()> + Send + 'static {
+                std::future::poll_fn(move |cx| {
+                    *me.lock().unwrap() = Some(cx.waker().clone());
+
+                    if Handle::is_tracing() {
+                        if let Some(waker) = other.lock().unwrap().as_ref() {
+                            waker.wake_by_ref();
+                        }
+                    }
+
+                    Poll::<()>::Pending
+                })
+            }
+
+            let slot_a = Arc::new(Mutex::new(None));
+            let slot_b = Arc::new(Mutex::new(None));
+
+            let a = tokio::spawn(task(slot_a.clone(), slot_b.clone()));
+            let b = tokio::spawn(task(slot_b, slot_a));
+
+            tokio::task::yield_now().await;
+            let _dump = Handle::current().dump().await;
+
+            assert!(
+                !a.is_finished() && !b.is_finished(),
+                "taking a task dump must not terminate the traced tasks"
+            );
+            a.abort();
+            b.abort();
+        });
+    }
+}
+
 #[test]
 fn multi_thread() {
     let rt = runtime::Builder::new_multi_thread()
